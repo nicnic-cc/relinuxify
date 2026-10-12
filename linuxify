@@ -190,14 +190,34 @@ write_env_file() {
         echo "# Source it from ~/.bashrc or ~/.zshrc:"
         echo "#   $(source_line)"
         echo
-        # Prepend a directory once, and only if it exists.
+        # Move a directory to the front of a search path, adding it if it is
+        # missing and removing any other copy. Moving, not skipping, matters:
+        # a shell can inherit these directories behind /usr/bin (for example
+        # after macOS path_helper reorders PATH in a nested login shell).
         cat << 'EOF'
-_linuxify_path() { [ -d "$1" ] || return 0; case ":$PATH:" in *":$1:"*) ;; *) PATH="$1:$PATH" ;; esac; }
-_linuxify_man() { [ -d "$1" ] || return 0; case ":${MANPATH:-}:" in *":$1:"*) ;; *) MANPATH="$1:${MANPATH:-}" ;; esac; }
-_linuxify_info() { [ -d "$1" ] || return 0; case ":${INFOPATH:-}:" in *":$1:"*) ;; *) INFOPATH="$1:${INFOPATH:-}" ;; esac; }
+_linuxify_front() {
+    [ -d "$2" ] || return 0
+    eval "_linuxify_v=\":\${$1:-}:\""
+    while :; do
+        case "$_linuxify_v" in
+            *":$2:"*) _linuxify_v="${_linuxify_v%%:"$2":*}:${_linuxify_v#*:"$2":}" ;;
+            *) break ;;
+        esac
+    done
+    _linuxify_v="${_linuxify_v#:}"
+    _linuxify_v="${_linuxify_v%:}"
+    eval "$1=\"\$2\${_linuxify_v:+:\$_linuxify_v}\""
+}
+_linuxify_path() { _linuxify_front PATH "$1"; }
+_linuxify_man() { _linuxify_front MANPATH "$1"; }
+_linuxify_info() { _linuxify_front INFOPATH "$1"; }
+
+# An empty entry tells man and info to search their default paths too.
+[ -n "${MANPATH:-}" ] || MANPATH=:
+[ -n "${INFOPATH:-}" ] || INFOPATH=:
 EOF
         echo
-        echo "# Homebrew itself (no-ops when 'brew shellenv' already ran)"
+        echo "# Homebrew itself"
         echo "_linuxify_path \"$p/sbin\""
         echo "_linuxify_path \"$p/bin\""
         echo "_linuxify_man \"$p/share/man\""
@@ -219,7 +239,8 @@ EOF
         done
         echo
         echo "export PATH MANPATH INFOPATH"
-        echo "unset -f _linuxify_path _linuxify_man _linuxify_info"
+        echo "unset -f _linuxify_front _linuxify_path _linuxify_man _linuxify_info"
+        echo "unset _linuxify_v"
     } > "$ENV_FILE"
 }
 
