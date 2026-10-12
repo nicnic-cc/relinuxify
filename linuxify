@@ -1,225 +1,457 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# linuxify: make the macOS command line behave like GNU/Linux.
+# Must stay compatible with bash 3.2 (/bin/bash on macOS): no associative
+# arrays, no mapfile, no expansion of possibly-empty arrays under `set -u`.
 set -euo pipefail
 
-# Get full CPU brand string (e.g., "Apple M1" or "Intel(R) Core(TM) i5-...")
-# This is used to detect Apple Silicon vs Intel Macs
-export CPU_BRAND_STRING="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'Unknown')"
+LINUXIFY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BREWFILE="$LINUXIFY_DIR/Brewfile"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/linuxify"
+ENV_FILE="$CONFIG_DIR/env.sh"       # sourced by the user's shell
+MANAGED_FILE="$CONFIG_DIR/managed"  # formulas linuxify owns, one per line
+STATE_FILE="$CONFIG_DIR/state"      # other changes install made, key=value
+GDBINIT="$HOME/.gdbinit"
+GDB_LINE="set startup-with-shell off"
+RC_FILES=".bashrc .bash_profile .profile .zshrc .zprofile"
 
-linuxify_check_os() {
-  if ! [[ "$OSTYPE" =~ darwin* ]]; then
-      echo "This is meant to be run on macOS only"
-      exit
-  fi
+# Formulas whose libexec/gnubin holds the unprefixed GNU command names.
+GNUBIN_FORMULAS="coreutils ed findutils gawk gnu-indent gnu-sed gnu-tar gnu-which gpatch grep make"
+# Keg-only formulas whose bin directory goes on PATH.
+KEG_BIN_FORMULAS="file-formula gnu-getopt unzip"
+# Commands `status` expects to resolve to a Homebrew binary.
+STATUS_COMMANDS="awk bash find getopt git grep ls make patch pip python sed ssh tar which"
+
+ASSUME_YES=false
+ADOPT=false
+
+die() { echo "linuxify: $*" >&2; exit 1; }
+note() { echo "==> $*"; }
+
+# confirm PROMPT: ask y/N on a terminal; false when not interactive.
+confirm() {
+    [ -t 0 ] || return 1
+    local reply
+    read -r -p "$1 [y/N] " reply
+    [[ $reply =~ ^[Yy] ]]
 }
 
-linuxify_check_brew() {
-  if ! command -v brew > /dev/null; then
-      echo "Homebrew not installed!"
-      echo "In order to use this script please install homebrew from https://brew.sh"
-      exit
-  fi
+# words LIST: print LIST on one line, single-spaced.
+words() {
+    # shellcheck disable=SC2086
+    echo $1
 }
 
-linuxify_set_prefix() {
-  export BREW_PREFIX="$(brew --prefix)"
+# in_list WORD LIST: true when WORD is in the whitespace-separated LIST.
+in_list() {
+    case " $(words "$2") " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-linuxify_check_dirs() {
-    result=0
-    for dir in ${BREW_PREFIX}/bin ${BREW_PREFIX}/sbin; do
-        if [[ ! -d $dir || ! -w $dir ]]; then
-            echo "$dir must exist and be writeable"
-            result=1
-        fi
+# without WORD LIST: print LIST minus WORD.
+without() {
+    local out="" w
+    for w in $2; do
+        [ "$w" = "$1" ] || out="$out $w"
     done
-
-    return $result
+    words "$out"
 }
 
-linuxify_formulas=(
-    # GNU programs non-existing in macOS
-    "watch"
-    "wget"
-    "wdiff"
-    # "gdb" intel only
-    "autoconf"
-
-    # GNU programs whose BSD counterpart is installed in macOS
-    "coreutils"
-    "binutils"
-    "diffutils"
-    "ed"
-    "findutils"
-    "gawk"
-    "gnu-indent"
-    "gnu-sed"
-    "gnu-tar"
-    "gnu-which"
-    "grep"
-    "gzip"
-    "screen"
-
-    # GNU programs existing in macOS which are outdated
-    "bash"
-    "emacs"
-    "gpatch"
-    "less"
-    "m4"
-    "make"
-    "nano"
-    "bison"
-
-    # BSD programs existing in macOS which are outdated
-    "flex"
-
-    # Other common/preferred programs in GNU/Linux distributions
-    "libressl"
-    "file-formula"
-    "git"
-    "openssh"
-    "perl"
-    "python"
-    "rsync"
-    "unzip"
-    "vim"
-)
-
-linuxify_install_gdb() {
-    if ! brew ls --versions gdb > /dev/null; then
-        echo "Installing gdb"
-        brew install gdb
-    fi
-    # gdb requires special privileges to access Mach ports.
-    # One can either codesign the binary as per https://sourceware.org/gdb/wiki/BuildingOnDarwin
-    # Or, on 10.12 Sierra or later with SIP, declare `set startup-with-shell off` in `~/.gdbinit`:
-    grep -qF 'set startup-with-shell off' ~/.gdbinit || echo 'set startup-with-shell off' | tee -a ~/.gdbinit > /dev/null
+# tilde PATH: PATH with $HOME shown as ~, for messages.
+tilde() {
+    case "$1" in
+        "$HOME"/*) echo "~${1#"$HOME"}" ;;
+        *) echo "$1" ;;
+    esac
 }
 
-linuxify_install() {
-    linuxify_check_os;
-    linuxify_check_brew;
-    linuxify_set_prefix;
-    linuxify_check_dirs;
-
-    # Install all formulas
-    for (( i=0; i<${#linuxify_formulas[@]}; i++ )); do
-        if brew ls --versions ${linuxify_formulas[i]}; then
-            echo "Found Existing ${linuxify_formulas[i]}"
-        else
-            echo "Installing ${linuxify_formulas[i]}"
-            brew install ${linuxify_formulas[i]}
-        fi
-    done
-
-    # Only install gdb on Intel Macs (not supported on Apple Silicon)
-    if [[ ! $CPU_BRAND_STRING =~ ^Apple ]]; then
-        linuxify_install_gdb
-    fi
-
-    # Offer to change shell to newly installed bash
-    read -p "Do you want to change your shell to the latest bash (Y/N)? " -n 1 -r
-    if [[ $REPLY =~ [Yy]$ ]]; then
-        grep -qF "${BREW_PREFIX}/bin/bash" /etc/shells || echo "${BREW_PREFIX}/bin/bash" | sudo tee -a /etc/shells > /dev/null
-        echo # Blank line so the password entry isn't bunched-up
-        chsh -s ${BREW_PREFIX}/bin/bash
+# The line that goes in ~/.bashrc or ~/.zshrc. It has no user- or
+# machine-specific path, so the same dotfiles work on every Mac.
+source_line() {
+    local f
+    # shellcheck disable=SC2016,SC2088 # printed for the user's shell to expand
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        f='"${XDG_CONFIG_HOME:-$HOME/.config}/linuxify/env.sh"'
     else
-        echo "OK, leaving your shell as $SHELL"
+        f='~/.config/linuxify/env.sh'
     fi
-
-
-    # Make changes to PATH/MANPATH/INFOPATH/LDFLAGS/CPPFLAGS
-    cp .linuxify ~/.linuxify
-    echo "Add '. ~/.linuxify' to your ~/.bashrc, ~/.zshrc or your shell's equivalent config file"
+    echo "[ -f $f ] && . $f"
 }
 
-linuxify_uninstall() {
-    linuxify_check_os;
-    linuxify_check_brew;
-    linuxify_set_prefix;
+# --- environment ----------------------------------------------------------
 
-    # Remove gdb fix
-    [ -f ~/.gdbinit ] && sed -i.bak '/set startup-with-shell off/d' ~/.gdbinit && rm ~/.gdbinit.bak
+check_env() {
+    [ "$(uname -s)" = Darwin ] || die "this is meant to be run on macOS only"
+    command -v brew > /dev/null || die "Homebrew is not installed; see https://brew.sh"
+    BREW_PREFIX="$(brew --prefix)"
+    BREW_BASH="$BREW_PREFIX/bin/bash"
+    [ -f "$BREWFILE" ] || die "Brewfile not found next to the script ($(tilde "$BREWFILE"))"
+}
 
-    # Offer to change default shell back to macOS default
-    # macOS 10.15 Catalina and later (including 11+ Big Sur, Monterey, Ventura, Sonoma, Sequoia): zsh
-    # macOS 10.14 Mojave and earlier: bash
-    bash_is_local=false
-    if [[ $SHELL =~ local ]]; then
-        read -p "Do you want to change your shell back to macOS default (macOS >= 10.15 Catalina ? zsh : bash) ? " -n 1 -r
-        if [[ $REPLY =~ [Yy]$ ]]; then
-            sudo sed -i.bak "|${BREW_PREFIX}/bin/bash|d" /etc/shells && sudo rm /etc/shells.bak
-            echo
-            # Get macOS version - handle both 10.x and 11+ versioning schemes
-            macos_version=$(sw_vers -productVersion)
-            major_version=$(echo "$macos_version" | awk -F. '{print $1}')
-            minor_version=$(echo "$macos_version" | awk -F. '{print $2}')
+check_dirs() {
+    local dir
+    for dir in "$BREW_PREFIX/bin" "$BREW_PREFIX/sbin"; do
+        if [ ! -d "$dir" ] || [ ! -w "$dir" ]; then
+            die "$dir must exist and be writable"
+        fi
+    done
+}
 
-            # macOS 10.15+ (Catalina) or macOS 11+ use zsh as default
-            if [[ $major_version -gt 10 ]] || [[ $major_version -eq 10 && $minor_version -gt 14 ]]; then
-                chsh -s /bin/zsh
+is_intel() { [ "$(uname -m)" = x86_64 ]; }
+
+login_shell() {
+    dscl . -read "/Users/${USER:-$(id -un)}" UserShell 2> /dev/null | awk '{print $2}' || echo "${SHELL:-}"
+}
+
+# rc_mentions TEXT: print the shell config files in $HOME that contain TEXT.
+rc_mentions() {
+    local rc
+    for rc in $RC_FILES; do
+        if [ -f "$HOME/$rc" ] && grep -q -F "$1" "$HOME/$rc"; then
+            # shellcheck disable=SC2088 # displayed, not expanded
+            echo "~/$rc"
+        fi
+    done
+}
+
+# --- Homebrew -------------------------------------------------------------
+
+is_installed() { brew list --versions "$1" > /dev/null 2>&1; }
+
+brewfile_formulas() { brew bundle list --formula --file="$BREWFILE"; }
+
+# removable_subset LIST: print the members of LIST that can be uninstalled
+# without breaking an installed formula outside LIST. Reports skips on stderr.
+removable_subset() {
+    local set="$1" changed=1 next f dep blocker
+    while [ "$changed" -eq 1 ]; do
+        changed=0
+        next=""
+        for f in $set; do
+            blocker=""
+            for dep in $(brew uses --installed "$f" 2> /dev/null); do
+                if ! in_list "$dep" "$set"; then
+                    blocker="$dep"
+                    break
+                fi
+            done
+            if [ -n "$blocker" ]; then
+                echo "    keeping $f: required by $blocker" >&2
+                changed=1
             else
-                chsh -s /bin/bash
+                next="$next $f"
             fi
-        else
-            echo "OK, leaving your shell as $SHELL"
-            if [[ $SHELL == ${BREW_PREFIX}/bin/bash ]]; then
-                bash_is_local=true
+        done
+        set="$next"
+    done
+    words "$set"
+}
+
+# --- records in ~/.config/linuxify ----------------------------------------
+
+managed_formulas() {
+    if [ -f "$MANAGED_FILE" ]; then
+        grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$MANAGED_FILE" || true
+    fi
+}
+
+# write_managed LIST: store LIST, one formula per line, sorted.
+write_managed() {
+    local f
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# Formulas linuxify installed or adopted; 'linuxify uninstall' removes them."
+        for f in $1; do echo "$f"; done | sort -u
+    } > "$MANAGED_FILE"
+}
+
+state_get() {
+    if [ -f "$STATE_FILE" ]; then
+        sed -n "s/^$1=//p" "$STATE_FILE" | tail -n 1
+    fi
+}
+
+# state_set KEY VALUE: record a change, unless KEY is already recorded.
+# The first value wins, so reinstalling never overwrites what to restore.
+state_set() {
+    [ -z "$(state_get "$1")" ] || return 0
+    mkdir -p "$CONFIG_DIR"
+    echo "$1=$2" >> "$STATE_FILE"
+}
+
+# --- generated env.sh -----------------------------------------------------
+
+write_env_file() {
+    local p="$BREW_PREFIX" f
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# Generated by 'linuxify install'. Do not edit: rerun the install instead."
+        echo "# Source it from ~/.bashrc or ~/.zshrc:"
+        echo "#   $(source_line)"
+        echo
+        # Prepend a directory once, and only if it exists.
+        cat << 'EOF'
+_linuxify_path() { [ -d "$1" ] || return 0; case ":$PATH:" in *":$1:"*) ;; *) PATH="$1:$PATH" ;; esac; }
+_linuxify_man() { [ -d "$1" ] || return 0; case ":${MANPATH:-}:" in *":$1:"*) ;; *) MANPATH="$1:${MANPATH:-}" ;; esac; }
+_linuxify_info() { [ -d "$1" ] || return 0; case ":${INFOPATH:-}:" in *":$1:"*) ;; *) INFOPATH="$1:${INFOPATH:-}" ;; esac; }
+EOF
+        echo
+        echo "# Homebrew itself (no-ops when 'brew shellenv' already ran)"
+        echo "_linuxify_path \"$p/sbin\""
+        echo "_linuxify_path \"$p/bin\""
+        echo "_linuxify_man \"$p/share/man\""
+        echo "_linuxify_info \"$p/share/info\""
+        echo
+        echo "# python and pip for Homebrew's python 3"
+        echo "_linuxify_path \"$p/opt/python/libexec/bin\""
+        echo
+        echo "# keg-only formulas"
+        for f in $KEG_BIN_FORMULAS; do
+            echo "_linuxify_path \"$p/opt/$f/bin\""
+            echo "_linuxify_man \"$p/opt/$f/share/man\""
+        done
+        echo
+        echo "# GNU commands under their unprefixed names, ahead of the BSD ones"
+        for f in $GNUBIN_FORMULAS; do
+            echo "_linuxify_path \"$p/opt/$f/libexec/gnubin\""
+            echo "_linuxify_man \"$p/opt/$f/libexec/gnuman\""
+        done
+        echo
+        echo "export PATH MANPATH INFOPATH"
+        echo "unset -f _linuxify_path _linuxify_man _linuxify_info"
+    } > "$ENV_FILE"
+}
+
+# --- commands -------------------------------------------------------------
+
+cmd_install() {
+    check_env
+    check_dirs
+
+    local wanted f preexisting="" managed unadopted=""
+    wanted="$(brewfile_formulas)"
+    for f in $wanted; do
+        if is_installed "$f"; then
+            preexisting="$preexisting $f"
+        fi
+    done
+
+    note "Installing formulas from $(tilde "$BREWFILE")"
+    brew bundle install --no-upgrade --file="$BREWFILE"
+
+    managed="$(managed_formulas)"
+    for f in $wanted; do
+        if $ADOPT || ! in_list "$f" "$preexisting"; then
+            managed="$managed $f"
+        elif ! in_list "$f" "$managed"; then
+            unadopted="$unadopted $f"
+        fi
+    done
+    write_managed "$managed"
+    if [ -n "$unadopted" ]; then
+        echo "    Already installed before, so not recorded as managed: $(words "$unadopted")"
+        echo "    Rerun with --adopt if 'linuxify uninstall' should remove them too."
+    fi
+
+    if is_intel; then
+        # gdb needs this to start programs under SIP; see https://sourceware.org/gdb/wiki/BuildingOnDarwin
+        [ -e "$GDBINIT" ] || state_set created_gdbinit 1
+        if ! grep -qxF "$GDB_LINE" "$GDBINIT" 2> /dev/null; then
+            echo "$GDB_LINE" >> "$GDBINIT"
+            state_set added_gdbinit_line 1
+        fi
+    fi
+
+    write_env_file
+    note "Wrote $(tilde "$ENV_FILE")"
+
+    local current_shell
+    current_shell="$(login_shell)"
+    if [ "$current_shell" != "$BREW_BASH" ] && confirm "Change your login shell to $BREW_BASH?"; then
+        if ! grep -qxF "$BREW_BASH" /etc/shells; then
+            echo "$BREW_BASH" | sudo tee -a /etc/shells > /dev/null
+            state_set added_etc_shells 1
+        fi
+        chsh -s "$BREW_BASH"
+        state_set previous_shell "$current_shell"
+    fi
+
+    if [ -z "$(rc_mentions 'linuxify/env.sh')" ]; then
+        note "Add this line to ~/.bashrc or ~/.zshrc, then open a new terminal:"
+        echo "    $(source_line)"
+    fi
+}
+
+cmd_uninstall() {
+    check_env
+
+    local managed set="" f
+    managed="$(managed_formulas)"
+    if [ -z "$managed" ]; then
+        note "No formulas recorded in $(tilde "$MANAGED_FILE"); none will be uninstalled"
+    fi
+    for f in $managed; do
+        if is_installed "$f"; then
+            set="$set $f"
+        fi
+    done
+
+    if [ -n "$set" ]; then
+        note "Checking which formulas other installed formulas still need"
+        set="$(removable_subset "$set")"
+    fi
+
+    # Move the login shell off Homebrew's bash when install switched it there
+    # (back to the recorded shell), or when that bash is about to be
+    # uninstalled (to /bin/zsh, the macOS default, if nothing was recorded).
+    local restore_shell=""
+    if [ "$(login_shell)" = "$BREW_BASH" ]; then
+        restore_shell="$(state_get previous_shell)"
+        if [ -z "$restore_shell" ] && in_list bash "$set"; then
+            restore_shell=/bin/zsh
+        fi
+    fi
+
+    if ! $ASSUME_YES; then
+        note "Preview. 'linuxify uninstall --yes' would:"
+        [ -n "$restore_shell" ] && echo "    change your login shell to $restore_shell"
+        echo "    uninstall: ${set:-nothing}"
+        if in_list bash "$set"; then
+            echo "    remove $BREW_BASH from /etc/shells"
+        fi
+        if [ -n "$(state_get added_gdbinit_line)" ]; then
+            echo "    remove '$GDB_LINE' from $(tilde "$GDBINIT")"
+        fi
+        echo "    offer to run 'brew autoremove' for dependencies nothing needs any more"
+        echo "    delete $(tilde "$CONFIG_DIR")"
+        return 0
+    fi
+
+    if [ -n "$restore_shell" ]; then
+        if ! chsh -s "$restore_shell"; then
+            echo "    Could not change the login shell; keeping bash installed"
+            set="$(without bash "$set")"
+        fi
+    fi
+
+    if [ -n "$set" ]; then
+        # shellcheck disable=SC2086
+        brew uninstall $set
+    fi
+
+    # Drop the /etc/shells entry once that bash is gone, so it does not point
+    # at a missing binary.
+    if in_list bash "$set" && grep -qxF "$BREW_BASH" /etc/shells; then
+        sudo /usr/bin/sed -i '' "\\|^${BREW_BASH}\$|d" /etc/shells
+    fi
+
+    if [ -n "$(state_get added_gdbinit_line)" ] && [ -f "$GDBINIT" ]; then
+        /usr/bin/sed -i '' "/^${GDB_LINE}\$/d" "$GDBINIT"
+        if [ -n "$(state_get created_gdbinit)" ] && [ ! -s "$GDBINIT" ]; then
+            rm -f "$GDBINIT"
+        fi
+    fi
+
+    if [ -n "$set" ]; then
+        local orphans
+        orphans="$(brew autoremove --dry-run 2> /dev/null | grep -v '^==>' || true)"
+        if [ -n "$orphans" ]; then
+            note "These dependencies are no longer needed by any formula:"
+            echo "$orphans"
+            if confirm "Run 'brew autoremove' to remove them?"; then
+                brew autoremove
+            else
+                echo "    Skipped. Run 'brew autoremove' yourself to remove them."
             fi
         fi
     fi
 
-    # Uninstall all formulas in reverse order
-    for (( i=${#linuxify_formulas[@]}-1; i>=0; i-- )); do
-        if [[ ${linuxify_formulas[i]} != bash ]]; then
-            brew uninstall -f $(echo "${linuxify_formulas[i]}" | cut -d ' ' -f1)
-        fi
-    done
+    rm -f "$ENV_FILE" "$MANAGED_FILE" "$STATE_FILE"
+    rmdir "$CONFIG_DIR" 2> /dev/null || true
+    note "Deleted $(tilde "$CONFIG_DIR")"
 
-    # Only remove bash if the user didn't elect to keep it as their shell
-    if [[ "$bash_is_local" != true ]]; then
-        brew uninstall bash
+    local rcs
+    rcs="$(rc_mentions 'linuxify')"
+    if [ -n "$rcs" ]; then
+        note "Remove the line that sources linuxify from: $(words "$rcs")"
     fi
-
-    # Remove changes to PATH/MANPATH/INFOPATH/LDFLAGS/CPPFLAGS
-    rm -f ~/.linuxify
-    echo "Remove '. ~/.linuxify' from your ~/.bashrc, ~/.zshrc or your shell's equivalent config file"
 }
 
-linuxify_info() {
-    linuxify_check_os;
-    linuxify_check_brew;
+cmd_status() {
+    check_env
 
-    for (( i=0; i<${#linuxify_formulas[@]}; i++ )); do
-        brew info $(echo "${linuxify_formulas[i]}" | cut -d ' ' -f1)
-        printf "\n\n===============================================================================================================================\n\n"
-    done
-}
-
-linuxify_help() {
-  echo "usage: linuxify [-h] [command]";
-  echo ""
-  echo "valid commands:"
-  echo "  install    install GNU/Linux utilities"
-  echo "  uninstall  uninstall GNU/Linux utilities"
-  echo "  info       show info on GNU/Linux utilities"
-  echo ""
-  echo "optional arguments:"
-  echo "  -h, --help  show this help message and exit"
-}
-
-linuxify_main() {
-    if [ $# -eq 1 ]; then
-        case $1 in
-            "install") linuxify_install ;;
-            "uninstall") linuxify_uninstall ;;
-            "info") linuxify_info ;;
-            "-h") linuxify_help ;;
-            "--help") linuxify_help ;;
-        esac
+    local failures=0 c path
+    if [ -f "$ENV_FILE" ]; then
+        echo "ok    $(tilde "$ENV_FILE") exists"
     else
-        linuxify_help;
-        exit
+        echo "FAIL  $(tilde "$ENV_FILE") missing; run 'linuxify install'"
+        failures=$((failures + 1))
+    fi
+
+    for c in $STATUS_COMMANDS; do
+        path="$(command -v "$c" || true)"
+        case "$path" in
+            "$BREW_PREFIX"/*) echo "ok    $c -> $path" ;;
+            "") echo "FAIL  $c not found"; failures=$((failures + 1)) ;;
+            *) echo "FAIL  $c -> $path (not from Homebrew)"; failures=$((failures + 1)) ;;
+        esac
+    done
+
+    if [ "$failures" -ne 0 ]; then
+        echo "$failures check(s) failed. Open a new terminal after 'linuxify install', or check the line that sources env.sh."
+        return 1
     fi
 }
 
-linuxify_main "$@"
+cmd_info() {
+    check_env
+    # shellcheck disable=SC2046
+    brew info $(brewfile_formulas)
+}
+
+usage() {
+    cat << EOF
+usage: linuxify <command> [options]
+
+commands:
+  install     install the Brewfile formulas and write $(tilde "$ENV_FILE")
+  uninstall   undo install: uninstall the managed formulas, restore the login
+              shell, remove everything linuxify wrote (preview without --yes)
+  status      check that the GNU and Homebrew commands come first on PATH
+  info        show 'brew info' for the Brewfile formulas
+
+options:
+  --adopt     with install: also manage Brewfile formulas that were already
+              installed, so uninstall removes them too
+  --yes       with uninstall: carry it out instead of previewing it
+  -h, --help  show this help
+EOF
+}
+
+main() {
+    local command="" arg
+    for arg in "$@"; do
+        case "$arg" in
+            --yes) ASSUME_YES=true ;;
+            --adopt) ADOPT=true ;;
+            -h | --help) usage; exit 0 ;;
+            -*) usage >&2; die "unknown option: $arg" ;;
+            *)
+                [ -z "$command" ] || die "only one command allowed"
+                command="$arg"
+                ;;
+        esac
+    done
+
+    case "$command" in
+        install) cmd_install ;;
+        uninstall) cmd_uninstall ;;
+        status) cmd_status ;;
+        info) cmd_info ;;
+        "") usage >&2; exit 1 ;;
+        *) usage >&2; die "unknown command: $command" ;;
+    esac
+}
+
+main "$@"

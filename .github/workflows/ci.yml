@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck linuxify
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # /bin/bash is bash 3.2, which is what a fresh Mac runs the script with
+      - name: install
+        run: /bin/bash ./linuxify install
+      - name: status
+        run: |
+          . "$HOME/.config/linuxify/env.sh"
+          ./linuxify status
+          sed --version | head -1 | grep -q GNU
+          awk --version | head -1 | grep -q GNU
+          getopt --version | grep -q util-linux
+      - name: uninstall
+        run: |
+          /bin/bash ./linuxify uninstall
+          /bin/bash ./linuxify uninstall --yes
+          test ! -e "$HOME/.config/linuxify"
