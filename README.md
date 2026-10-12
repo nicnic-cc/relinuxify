@@ -1,10 +1,29 @@
 <p align="center"><img src="assets/icon.svg" width="128" alt="relinuxify icon"></p>
 
-# linuxify
+# relinuxify
 
-Make the macOS command line behave like GNU/Linux. linuxify installs the GNU versions of the BSD tools macOS ships (`sed`, `awk`, `grep`, `find`, `tar`, `ls`, ...) and puts them first on `PATH` under their usual names, so you don't need the `g` prefix. It also installs current versions of tools macOS ships old, such as `bash` and `make`.
+Make the macOS command line behave like GNU/Linux. relinuxify installs the GNU versions of the BSD tools macOS ships (`sed`, `awk`, `grep`, `find`, `tar`, `ls`, ...) and puts them first on `PATH` under their usual names, so you don't need the `g` prefix. It also installs current versions of tools macOS ships old, such as `bash` and `make`.
 
-Fork of [pkill37/linuxify](https://github.com/pkill37/linuxify), rewritten. Tested on Apple Silicon. Intel should work but is untested.
+A rewrite of [pkill37/linuxify](https://github.com/pkill37/linuxify); see [Changes from linuxify](#changes-from-linuxify). The script is still called `linuxify`. Tested on Apple Silicon. Intel should work but is untested.
+
+## Changes from linuxify
+
+Bugs fixed:
+
+- On Apple Silicon, `uninstall` skipped the login shell switch and then removed the Homebrew bash you were still logged in with. relinuxify switches the shell back before removing anything.
+- `uninstall` also removed Brewfile formulas you had installed yourself.
+- A broken `sed` command left Homebrew's bash in `/etc/shells` after uninstall.
+- `~/.linuxify` exported `LDFLAGS`, `CPPFLAGS` and `PKG_CONFIG_PATH` in every shell, each export overwriting the last, so builds linked against libressl. relinuxify sets none of them.
+- gawk and gpatch were installed, but `awk` and `patch` still ran the BSD versions.
+
+Other changes:
+
+- Formulas live in a [`Brewfile`](Brewfile) and install in one `brew bundle` run.
+- A generated `env.sh` that works in bash and zsh replaces the static `~/.linuxify`.
+- `install` records what it changes, so `uninstall` can undo it. See [What install changes](#what-install-changes).
+- New `status` command, and `install --adopt` for Macs set up by the old linuxify.
+- Dropped autoconf, binutils, bison, flex, libressl, m4, perl and vim. binutils was never on `PATH` anyway.
+- CI moved from the defunct Travis setup to GitHub Actions.
 
 ## Install
 
@@ -43,7 +62,7 @@ Source `env.sh` from `~/.bashrc` or `~/.zshrc` only, never from `~/.zshenv` or a
 
 The list lives in [`Brewfile`](Brewfile).
 
-GNU replacements for the BSD tools in macOS. These take over the plain command names:
+These GNU tools replace the BSD ones in macOS under the plain command names:
 
 | Formula | Commands | Replaces |
 | --- | --- | --- |
